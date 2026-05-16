@@ -377,10 +377,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         if vllm_config.model_config.use_mla:
             return None
         logger.info_once(
-            "MooncakeConnector setting KV cache layout to HND for "
+            "MooncakeConnector setting KV cache layout to HNC for "
             "heterogeneous TP-safe KV transfer."
         )
-        return "HND"
+        return "HNC"
 
     ############################################################
     # Scheduler Side Methods
@@ -1395,10 +1395,9 @@ class MooncakeConnectorWorker:
         seen_base_addresses = []
         self.block_len_per_layer = []
 
-        split_k_and_v = self.transfer_topo.split_k_and_v
         tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
-            cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
+            cache_list = [cache_or_caches]
             logger.debug(
                 "registering layer %s with %d cache tensor(s)",
                 layer_name,
