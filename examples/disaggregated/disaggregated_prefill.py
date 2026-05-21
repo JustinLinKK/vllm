@@ -1,127 +1,92 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-This file demonstrates the example usage of disaggregated prefilling
-We will launch 2 vllm instances (GPU 0 for prefill and GPU 1 for decode),
-and then transfer the KV cache between them.
-"""
+"""Run the disaggregated prefill shell demo from the active conda env."""
+
+from __future__ import annotations
 
 import os
-import time
-from multiprocessing import Event, Process
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
-from vllm import LLM, SamplingParams
-from vllm.config import KVTransferConfig
+
+def _runtime_env(runtime_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    script_dir = runtime_dir.parent.parent
+    rpc_dir = runtime_dir / "rpc"
+    rpc_socket_dir = script_dir / ".r"
+
+    host_ip = env.get("VLLM_HOST_IP", "")
+    if not host_ip or host_ip == "localhost":
+        env["VLLM_HOST_IP"] = "127.0.0.1"
+    elif host_ip != "127.0.0.1":
+        raise SystemExit(
+            "VLLM_HOST_IP must stay on loopback for this example. Use 127.0.0.1."
+        )
+
+    env["TMPDIR"] = str(runtime_dir / "tmp")
+    env["VLLM_RPC_BASE_PATH"] = str(rpc_socket_dir)
+    env["VLLM_CACHE_ROOT"] = str(runtime_dir / "cache")
+    env["VLLM_CONFIG_ROOT"] = str(runtime_dir / "config")
+    env["HF_HOME"] = str(runtime_dir / "hf")
+    env["XDG_CACHE_HOME"] = str(runtime_dir / "xdg-cache")
+
+    for key in (
+        "TMPDIR",
+        "VLLM_CACHE_ROOT",
+        "VLLM_CONFIG_ROOT",
+        "HF_HOME",
+        "XDG_CACHE_HOME",
+    ):
+        Path(env[key]).mkdir(parents=True, exist_ok=True)
+
+    rpc_dir.mkdir(parents=True, exist_ok=True)
+    if rpc_socket_dir.is_symlink() or rpc_socket_dir.is_file():
+        rpc_socket_dir.unlink()
+    elif rpc_socket_dir.exists():
+        shutil.rmtree(rpc_socket_dir)
+    rpc_socket_dir.symlink_to(rpc_dir)
+
+    return env
 
 
-def run_prefill(prefill_done):
-    # We use GPU 0 for prefill node.
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+def _cleanup_runtime_link(script_dir: Path) -> None:
+    rpc_socket_dir = script_dir / ".r"
+    if rpc_socket_dir.is_symlink() or rpc_socket_dir.is_file():
+        rpc_socket_dir.unlink()
+    elif rpc_socket_dir.exists():
+        shutil.rmtree(rpc_socket_dir)
 
-    # The prefill node receives two requests, while the decode node receives
-    # three requests. So the decode node will only receive the KV Cache for
-    # requests 1 and 3. The decode node will use the KV Cache of requests 1
-    # and 3 and do prefilling on request 2.
-    prompts = [
-        "Hello, my name is",
-        "Hi, your name is",
-        # The decode node will actually "prefill" this request.
-        "Tell me a very long story",
-    ]
-    sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
 
-    # Using P2pNcclConnector to transmit KV caches between vLLM instances.
-    # This instance is the prefill node (kv_producer, rank 0).
-    # The number of parallel instances for KV cache transfer is set to 2,
-    # as required for P2pNcclConnector.
-    ktc = KVTransferConfig(
-        kv_connector="P2pNcclConnector",
-        kv_role="kv_producer",
-        kv_rank=0,
-        kv_parallel_size=2,
-    )
+def main() -> int:
+    if os.environ.get("CONDA_DEFAULT_ENV") != "vllm":
+        print(
+            "Activate conda environment 'vllm' before running this script.",
+            file=sys.stderr,
+        )
+        return 1
 
-    # Set GPU memory utilization to 0.8 for an A6000 GPU with 40GB
-    # memory. You may need to adjust the value to fit your GPU.
-    llm = LLM(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        kv_transfer_config=ktc,
-        max_model_len=2000,
-        gpu_memory_utilization=0.8,
-    )
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    repo_root = script_path.parents[2]
+    shell_script = script_dir / "disaggregated_prefill.sh"
 
-    llm.generate(prompts, sampling_params)
-    print("Prefill node is finished.")
-    prefill_done.set()
+    runtime_dir = script_dir / ".runtime" / "disaggregated_prefill"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    # To keep the prefill node running in case the decode node is not done;
-    # otherwise, the script might exit prematurely, causing incomplete decoding.
+    env = _runtime_env(runtime_dir)
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Script stopped by user.")
-
-
-def run_decode(prefill_done):
-    # We use GPU 1 for decode node.
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
-    prompts = [
-        "Hello, my name is",
-        "Hi, your name is",
-        "Tell me a very long story",
-    ]
-    sampling_params = SamplingParams(temperature=0, top_p=0.95)
-
-    # Using P2pNcclConnector to transmit KV caches between vLLM instances.
-    # This instance is the decode node (kv_consumer, rank 1).
-    # The number of parallel instances for KV cache transfer is set to 2,
-    # as required for P2pNcclConnector.
-    ktc = KVTransferConfig(
-        kv_connector="P2pNcclConnector",
-        kv_role="kv_consumer",
-        kv_rank=1,
-        kv_parallel_size=2,
-    )
-
-    # Set GPU memory utilization to 0.8 for an A6000 GPU with 40GB
-    # memory. You may need to adjust the value to fit your GPU.
-    llm = LLM(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        kv_transfer_config=ktc,
-        max_model_len=2000,
-        gpu_memory_utilization=0.8,
-    )
-
-    # Wait for the producer to start the pipe
-    print("Waiting for prefill node to finish...")
-    prefill_done.wait()
-
-    # At this point when the prefill_done is set, the kv-cache should have been
-    # transferred to this decode node, so we can start decoding.
-    outputs = llm.generate(prompts, sampling_params)
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-
-
-def main():
-    prefill_done = Event()
-    prefill_process = Process(target=run_prefill, args=(prefill_done,))
-    decode_process = Process(target=run_decode, args=(prefill_done,))
-
-    # Start prefill node
-    prefill_process.start()
-
-    # Start decode node
-    decode_process.start()
-
-    # Terminate the prefill node when decode is finished
-    decode_process.join()
-    prefill_process.terminate()
+        completed = subprocess.run(
+            ["bash", str(shell_script)],
+            cwd=repo_root,
+            env=env,
+            check=False,
+        )
+    finally:
+        _cleanup_runtime_link(script_dir)
+    return completed.returncode
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

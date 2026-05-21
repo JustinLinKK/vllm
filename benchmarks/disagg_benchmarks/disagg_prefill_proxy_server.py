@@ -3,18 +3,25 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import socket
+import threading
 import time
 import uuid
-from urllib.parse import urlparse
+from typing import Any
 
 import aiohttp
+import msgpack
 from quart import Quart, Response, make_response, request
+import zmq
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DEFAULT_PING_SECONDS = 5
 
 
 def parse_args():
@@ -37,20 +44,20 @@ def parse_args():
     parser.add_argument(
         "--prefill-url",
         type=str,
-        default="http://localhost:8100",
+        default="http://127.0.0.1:8100",
         help="Prefill service base URL (protocol + host[:port])",
     )
     parser.add_argument(
         "--decode-url",
         type=str,
-        default="http://localhost:8200",
+        default="http://127.0.0.1:8200",
         help="Decode service base URL (protocol + host[:port])",
     )
     parser.add_argument(
         "--kv-host",
         type=str,
-        default="localhost",
-        help="Hostname or IP used by KV transfer (default: localhost)",
+        default="127.0.0.1",
+        help="Hostname or IP used by KV transfer (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--prefill-kv-port",
@@ -64,8 +71,83 @@ def parse_args():
         default=14580,
         help="Decode KV port (default: 14580)",
     )
+    parser.add_argument(
+        "--discovery-host",
+        type=str,
+        default="127.0.0.1",
+        help="Host for the ZMQ discovery/router socket (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=30001,
+        help="Port for the ZMQ discovery/router socket (default: 30001)",
+    )
 
     return parser.parse_args()
+
+
+def _listen_for_register(
+    poller: zmq.Poller,
+    router_socket: zmq.Socket,
+    prefills: dict[str, tuple[str, float]],
+    decodes: dict[str, tuple[str, float]],
+) -> None:
+    while True:
+        try:
+            socks = dict(poller.poll())
+        except zmq.ZMQError:
+            return
+        if router_socket not in socks:
+            continue
+
+        try:
+            remote_address, message = router_socket.recv_multipart()
+        except zmq.ZMQError:
+            return
+        data = msgpack.loads(message)
+        role = data.get("type")
+        http_address = data.get("http_address")
+        zmq_address = data.get("zmq_address")
+        expiry = time.time() + DEFAULT_PING_SECONDS
+
+        if role == "P":
+            prefills[http_address] = (zmq_address, expiry)
+        elif role == "D":
+            decodes[http_address] = (zmq_address, expiry)
+        else:
+            logger.warning(
+                "Unexpected discovery message from %s: %s",
+                remote_address,
+                data,
+            )
+
+
+def start_service_discovery(
+    hostname: str,
+    port: int,
+) -> tuple[threading.Thread, zmq.Socket, zmq.Context]:
+    if not hostname:
+        hostname = socket.gethostname()
+    if port == 0:
+        raise ValueError("Discovery port cannot be 0")
+
+    context = zmq.Context()
+    router_socket = context.socket(zmq.ROUTER)
+    router_socket.bind(f"tcp://{hostname}:{port}")
+
+    poller = zmq.Poller()
+    poller.register(router_socket, zmq.POLLIN)
+
+    prefills: dict[str, tuple[str, float]] = {}
+    decodes: dict[str, tuple[str, float]] = {}
+    listener = threading.Thread(
+        target=_listen_for_register,
+        args=(poller, router_socket, prefills, decodes),
+        daemon=True,
+    )
+    listener.start()
+    return listener, router_socket, context
 
 
 def main():
@@ -87,6 +169,11 @@ def main():
         DECODE_KV_ADDR,
     )
 
+    discovery_thread, discovery_socket, discovery_context = start_service_discovery(
+        args.discovery_host,
+        args.discovery_port,
+    )
+
     app = Quart(__name__)
 
     # Attach the configuration object to the application instance so helper
@@ -106,22 +193,12 @@ def main():
         """Remove any trailing slash so path joins behave predictably."""
         return url.rstrip("/")
 
-    def _get_host_port(url: str) -> str:
-        """Return the hostname:port portion for logging and KV headers."""
-        parsed = urlparse(url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port
-        if port is None:
-            port = 80 if parsed.scheme == "http" else 443
-        return f"{host}:{port}"
-
     PREFILL_BASE = _normalize_base_url(PREFILL_SERVICE_URL)
     DECODE_BASE = _normalize_base_url(DECODE_SERVICE_URL)
-    KV_TARGET = _get_host_port(DECODE_SERVICE_URL)
 
     def _build_headers(request_id: str) -> dict[str, str]:
         """Construct the headers expected by vLLM's P2P disagg connector."""
-        headers: dict[str, str] = {"X-Request-Id": request_id, "X-KV-Target": KV_TARGET}
+        headers: dict[str, str] = {"X-Request-Id": request_id}
         api_key = os.environ.get("OPENAI_API_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -132,7 +209,7 @@ def main():
         payload: dict,
         headers: dict[str, str],
         request_id: str,
-    ):
+    ) -> dict[str, Any]:
         url = f"{PREFILL_BASE}{request_path}"
         start_ts = time.perf_counter()
         logger.info("[prefill] start request_id=%s url=%s", request_id, url)
@@ -146,13 +223,14 @@ def main():
                     raise RuntimeError(
                         f"Prefill backend error {resp.status}: {error_text}"
                     )
-                await resp.read()
+                response_json = await resp.json()
                 logger.info(
                     "[prefill] done request_id=%s status=%s elapsed=%.2fs",
                     request_id,
                     resp.status,
                     time.perf_counter() - start_ts,
                 )
+                return response_json
         except asyncio.TimeoutError as exc:
             raise RuntimeError(f"Prefill service timeout at {url}") from exc
         except aiohttp.ClientError as exc:
@@ -198,13 +276,50 @@ def main():
             logger.error("Decode service error at %s: %s", url, exc)
             yield b'{"error": "Decode service unavailable"}'
 
+    async def _run_decode_json(
+        request_path: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Fetch a standard non-streaming JSON completion from the decode stage."""
+        url = f"{DECODE_BASE}{request_path}"
+        logger.info(
+            "[decode] request json request_id=%s url=%s",
+            request_id,
+            url,
+        )
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session,
+                session.post(url=url, json=payload, headers=headers) as resp,
+            ):
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(
+                        f"Decode backend error {resp.status}: {error_text}"
+                    )
+                body = await resp.json()
+                logger.info(
+                    "[decode] json response request_id=%s status=%s",
+                    request_id,
+                    resp.status,
+                )
+                return body
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Decode service timeout at {url}") from exc
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"Decode service unavailable at {url}") from exc
+
     async def process_request():
         """Process a single request through prefill and decode stages"""
         try:
             original_request_data = await request.get_json()
+            client_wants_stream = bool(original_request_data.get("stream", False))
 
             # Create prefill request (max_tokens=1)
             prefill_request = original_request_data.copy()
+            prefill_request["stream"] = False
             prefill_request["max_tokens"] = 1
             if "max_completion_tokens" in prefill_request:
                 prefill_request["max_completion_tokens"] = 1
@@ -221,15 +336,25 @@ def main():
             headers = _build_headers(request_id)
             await _run_prefill(request.path, prefill_request, headers, request_id)
 
-            # Execute decode stage and stream response
             # Pass the unmodified user request so the decode phase can continue
             # sampling with the already-populated KV cache.
-            generator = _stream_decode(
+            if client_wants_stream:
+                generator = _stream_decode(
+                    request.path, original_request_data, headers, request_id
+                )
+                response = await make_response(generator)
+                response.timeout = None  # Disable timeout for streaming response
+                response.content_type = "text/event-stream"
+                return response
+
+            body = await _run_decode_json(
                 request.path, original_request_data, headers, request_id
             )
-            response = await make_response(generator)
-            response.timeout = None  # Disable timeout for streaming response
-            return response
+            return Response(
+                response=json.dumps(body),
+                status=200,
+                content_type="application/json",
+            )
 
         except Exception:
             logger.exception("Error processing request")
@@ -239,7 +364,16 @@ def main():
                 content_type="application/json",
             )
 
+    @app.route("/healthz", methods=["GET"])
+    async def healthz():
+        return Response(
+            response=b'{"status":"ok"}',
+            status=200,
+            content_type="application/json",
+        )
+
     @app.route("/v1/completions", methods=["POST"])
+    @app.route("/v1/chat/completions", methods=["POST"])
     async def handle_request():
         """Handle incoming API requests with concurrency and rate limiting"""
         try:
@@ -253,7 +387,12 @@ def main():
             )
 
     # Start the Quart server with host can be set to 0.0.0.0
-    app.run(port=PORT)
+    try:
+        app.run(host="127.0.0.1", port=PORT)
+    finally:
+        discovery_socket.close(linger=0)
+        discovery_context.term()
+        discovery_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

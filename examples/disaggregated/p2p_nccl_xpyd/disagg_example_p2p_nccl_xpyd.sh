@@ -21,7 +21,7 @@
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
-MODEL=${MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+MODEL=/shared/models/hf/Meta-Llama-3-8B-Instruct
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}
 
